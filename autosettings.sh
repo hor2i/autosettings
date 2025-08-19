@@ -174,20 +174,56 @@ EOF
   info_box "Fail2Ban" "Установлено и включено.\nПорт SSH: ${ssh_port}\n${jail_status}"
 }
 
-# --- Шаг 6/10: Автообновления (unattended-upgrades) ---
+# --- Шаг X: Автообновления (robust) ---
 step_unattended() {
   cls
-  yesno "Шаг 6/10 — Автообновления" "Включить unattended-upgrades (безопасность и система)?" || return 0
-  spinner "Настраиваю unattended-upgrades" bash -c "
+  yesno "Автообновления" "Включить unattended-upgrades (безопасность + обычные обновления)?" || return 0
+
+  spinner "Настраиваю unattended-upgrades и таймеры" bash -c '
+    set -e
+
+    # 1) Пакет
+    DEBIAN_FRONTEND=noninteractive apt-get update -y
     DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades
-    dpkg-reconfigure -fnoninteractive unattended-upgrades
-    cat >/etc/apt/apt.conf.d/20auto-upgrades <<'CFG'
+
+    # 2) Периодика APT — создаём 20auto-upgrades с нужными ключами
+    cat >/etc/apt/apt.conf.d/20auto-upgrades <<'"'"'CFG'"'"'
 APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
 CFG
-    systemctl restart unattended-upgrades || true
-  "
-  info_box "Готово" "Автообновления включены."
+
+    # 3) Политика: ставим security + updates (не только security)
+    . /etc/os-release || true
+    CODENAME="${VERSION_CODENAME:-$(lsb_release -sc 2>/dev/null || echo stable)}"
+
+    cat >/etc/apt/apt.conf.d/51unattended-upgrades <<EOF
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Ubuntu,archive=\${distro_codename}-security";
+        "origin=Ubuntu,archive=\${distro_codename}-updates";
+};
+// очищать зависимости, но не перезагружать автоматически
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+
+    # 4) Размаскируем и включим таймеры APT
+    systemctl unmask apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer || true
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+
+    # 5) Перезапустим таймеры (на всякий)
+    systemctl restart apt-daily.timer apt-daily-upgrade.timer
+
+    # 6) Немедленно обновим индексы, чтобы всё поехало
+    apt-get update -y
+  '
+
+  # Короткая справка
+  local t1 t2
+  t1=$(systemctl is-enabled apt-daily.timer 2>/dev/null || true)
+  t2=$(systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null || true)
+  info_box "Готово" "unattended-upgrades включён.\napt-daily.timer: ${t1}\napt-daily-upgrade.timer: ${t2}"
 }
 
 # --- Шаг 7/10: journald (лимиты + 4 месяца) ---
