@@ -292,10 +292,28 @@ step_motd_custom() {
   "
 
   spinner "Устанавливаю кастомный MOTD (dashboard.sh)" bash -c "
-    bash <(wget -qO- https://dignezzz.github.io/server/dashboard.sh)
+    yes | bash <(wget -qO- https://dignezzz.github.io/server/dashboard.sh)
   "
 
   info_box "Готово" "Стандартный MOTD отключён, кастомный установлен."
+}
+
+# --- Шаг 7.5: sysctl_opt.sh и unlimit_server.sh ---
+step_sysctl_unlimit() {
+  cls
+  if ! yesno "Шаг 7.5/8 — Оптимизация ядра/лимитов" "Установить sysctl_opt.sh и unlimit_server.sh (рекомендуется)?"; then
+    return 0
+  fi
+
+  spinner "Применяю sysctl_opt.sh" bash -c "
+    bash <(wget -qO- https://dignezzz.github.io/server/sysctl_opt.sh)
+  "
+
+  spinner "Применяю unlimit_server.sh" bash -c "
+    bash <(wget -qO- https://dignezzz.github.io/server/unlimit_server.sh)
+  "
+
+  info_box "Готово" "Скрипты sysctl_opt.sh и unlimit_server.sh применены."
 }
 
 # --- Шаг 8: Вывести ссылку/команду на BBR3 (без запуска) ---
@@ -313,13 +331,14 @@ main() {
 
   info_box "Мастер настройки" "Запускаю интерактивный мастер. После каждого шага — очистка экрана."
 
-  step_hostname_tz;  cls
+  step_hostname_tz;   cls
   step_ssh_hardening; cls
   step_updates_now;   cls
   step_components;    cls
   step_unattended;    cls
   step_journald_limits; cls
   step_motd_custom;   cls
+  step_sysctl_unlimit; cls
   step_bbr3_link;     cls
 
   info_box "Готово" "Базовая настройка завершена.\nМожно закрыть окно и продолжить работу."
