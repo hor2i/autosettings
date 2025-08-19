@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # === Интерактивный установщик базовой конфигурации Ubuntu ===
-# Требования: root. Диалоги через whiptail. Каждый шаг — очистка экрана.
+# Требования: root. Диалоги через whiptail. После каждого шага — очистка экрана.
 
 require_root() { if [[ $EUID -ne 0 ]]; then echo "Запусти: sudo bash $0"; exit 1; fi; }
 
@@ -39,10 +39,10 @@ apply_and_restart_sshd_safely() {
   fi
 }
 
-# --- Шаг 1: Hostname + TZ Moscow ---
+# --- Шаг 1/10: Hostname + TZ Moscow ---
 step_hostname_tz() {
   cls
-  yesno "Шаг 1/9 — Имя сервера и часовой пояс" "Установить hostname и часовой пояс Europe/Moscow?" || return 0
+  yesno "Шаг 1/10 — Имя сервера и часовой пояс" "Установить hostname и часовой пояс Europe/Moscow?" || return 0
   local new_hostname; new_hostname=$(input_box "Имя сервера" "Введи hostname (например, prst-srv-01):" "") || return 0
   [[ -z "$new_hostname" ]] && { info_box "Hostname" "Пустое имя — пропуск."; return 0; }
 
@@ -57,10 +57,10 @@ step_hostname_tz() {
   info_box "Готово" "Имя: $new_hostname\nTZ: Europe/Moscow."
 }
 
-# --- Шаг 2: SSH порт/ключ/только ключи/root/лимиты ---
+# --- Шаг 2/10: SSH порт/ключ/только ключи/root/лимиты ---
 step_ssh_hardening() {
   cls
-  yesno "Шаг 2/9 — SSH" "Настроить SSH: кастомный порт, вход только по ключам,\nroot по ключам, MaxAuthTries=2, MaxSessions=2?" || return 0
+  yesno "Шаг 2/10 — SSH" "Настроить SSH: кастомный порт, вход только по ключам,\nroot по ключам, MaxAuthTries=2, MaxSessions=2?" || return 0
 
   local ssh_port; ssh_port=$(input_box "Порт SSH" "Введи новый порт (1024–65535):" "2222") || return 0
   if ! [[ "$ssh_port" =~ ^[0-9]+$ ]] || (( ssh_port < 1024 || ssh_port > 65535 )); then
@@ -96,18 +96,18 @@ step_ssh_hardening() {
   info_box "SSH" "Новый порт: $ssh_port\nВход: только ключи; root — по ключу."
 }
 
-# --- Шаг 3: Обновление системы ---
+# --- Шаг 3/10: Обновление системы ---
 step_updates_now() {
   cls
-  yesno "Шаг 3/9 — Обновление" "Выполнить apt update && apt -y full-upgrade?" || return 0
+  yesno "Шаг 3/10 — Обновление" "Выполнить apt update && apt -y full-upgrade?" || return 0
   spinner "Обновляю систему" bash -c "apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade"
   info_box "Готово" "Система обновлена."
 }
 
-# --- Шаг 4: Базовые компоненты + Docker/compose ---
+# --- Шаг 4/10: Базовые компоненты + Docker/compose ---
 step_components() {
   cls
-  yesno "Шаг 4/9 — Компоненты" "Установить базовые утилиты и Docker + compose-plugin?" || return 0
+  yesno "Шаг 4/10 — Компоненты" "Установить базовые утилиты и Docker + compose-plugin?" || return 0
 
   spinner "Ставлю базовые пакеты" bash -c "
     apt-get update -y
@@ -125,10 +125,59 @@ step_components() {
   info_box "Готово" "Базовые утилиты и Docker установлены."
 }
 
-# --- Шаг 5: Автообновления (unattended-upgrades) ---
+# --- Шаг 5/10: Fail2Ban (базовая защита SSH) ---
+step_fail2ban_basic() {
+  cls
+  yesno "Шаг 5/10 — Fail2Ban" "Установить и включить базовую защиту SSH через fail2ban?" || return 0
+
+  # Определяем порт SSH из конфигурации
+  local ssh_port
+  ssh_port=$(awk '/^Port[[:space:]]+/ {print $2}' /etc/ssh/sshd_config | tail -n1)
+  [[ -z "$ssh_port" ]] && ssh_port=22
+
+  # Считаем текущий публичный IP (для whitelist), если получится
+  local pub_ip=""
+  pub_ip=$(curl -fsS4 https://api.ipify.org || curl -fsS4 https://ifconfig.me || true)
+  local ignoreip_default="${pub_ip}"
+
+  local ignoreip; ignoreip=$(input_box "Whitelist (ignoreip)" "Введи адреса/сети через пробел (доверенные IP). Можно оставить пустым.\nАвтодетект: ${ignoreip_default:-нет}:" "$ignoreip_default") || return 0
+  local bantime;   bantime=$(input_box "bantime" "Время бана (напр., 1h, 12h, 1d):" "1h") || return 0
+  local findtime;  findtime=$(input_box "findtime" "Окно анализа попыток (напр., 10m, 15m):" "10m") || return 0
+  local maxretry;  maxretry=$(input_box "maxretry" "Допустимо неудачных попыток до бана:" "3") || return 0
+
+  spinner "Устанавливаю и настраиваю fail2ban" bash -c "
+    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban
+    systemctl enable --now fail2ban
+
+    backup_file /etc/fail2ban/jail.local
+
+    cat >/etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 ${ignoreip}
+bantime  = ${bantime}
+findtime = ${findtime}
+maxretry = ${maxretry}
+backend  = systemd
+
+[sshd]
+enabled  = true
+port     = ${ssh_port}
+filter   = sshd
+# backend=systemd позволяет читать journal без пути к logpath
+EOF
+
+    systemctl restart fail2ban
+  "
+
+  # Короткая проверка статуса тюрьмы sshd (не фейлим мастер, если нет systemctl аутпута)
+  local jail_status; jail_status=$(fail2ban-client status sshd 2>/dev/null || true)
+  info_box "Fail2Ban" "Установлено и включено.\nПорт SSH: ${ssh_port}\n${jail_status}"
+}
+
+# --- Шаг 6/10: Автообновления (unattended-upgrades) ---
 step_unattended() {
   cls
-  yesno "Шаг 5/9 — Автообновления" "Включить unattended-upgrades (безопасность и система)?" || return 0
+  yesno "Шаг 6/10 — Автообновления" "Включить unattended-upgrades (безопасность и система)?" || return 0
   spinner "Настраиваю unattended-upgrades" bash -c "
     DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades
     dpkg-reconfigure -fnoninteractive unattended-upgrades
@@ -141,10 +190,10 @@ CFG
   info_box "Готово" "Автообновления включены."
 }
 
-# --- Шаг 6: journald (лимиты + 4 месяца) ---
+# --- Шаг 7/10: journald (лимиты + 4 месяца) ---
 step_journald_limits() {
   cls
-  yesno "Шаг 6/9 — Логи journald" "Ограничить размер журналов и хранить не более 4 месяцев?" || return 0
+  yesno "Шаг 7/10 — Логи journald" "Ограничить размер журналов и хранить не более 4 месяцев?" || return 0
   local max_use; max_use=$(input_box "Лимит journald" "SystemMaxUse (например, 500M или 1G):" "500M") || return 0
 
   spinner "Настраиваю journald" bash -c "
@@ -167,10 +216,10 @@ step_journald_limits() {
   info_box "Готово" "Лимит: $max_use; хранение: 120 дней."
 }
 
-# --- Шаг 7: Кастомный MOTD (автоответ y) ---
+# --- Шаг 8/10: Кастомный MOTD (автоответ y) ---
 step_motd_custom() {
   cls
-  yesno "Шаг 7/9 — MOTD" "Отключить стандартный MOTD и поставить кастомный?" || return 0
+  yesno "Шаг 8/10 — MOTD" "Отключить стандартный MOTD и поставить кастомный?" || return 0
 
   spinner "Отключаю стандартный MOTD" bash -c "
     if [[ -d /etc/update-motd.d ]]; then
@@ -185,25 +234,23 @@ step_motd_custom() {
   info_box "Готово" "Кастомный MOTD установлен."
 }
 
-# --- Шаг 8: sysctl_opt.sh и unlimit_server.sh ---
+# --- Шаг 9/10: sysctl_opt.sh и unlimit_server.sh ---
 step_sysctl_unlimit() {
   cls
-  yesno "Шаг 8/9 — Оптимизации системы" "Запустить sysctl_opt.sh и unlimit_server.sh (рекомендуется)?" || return 0
+  yesno "Шаг 9/10 — Оптимизации системы" "Запустить sysctl_opt.sh и unlimit_server.sh (рекомендуется)?" || return 0
   spinner "Применяю sysctl_opt.sh" bash -c "bash <(wget -qO- https://dignezzz.github.io/server/sysctl_opt.sh)"
   spinner "Применяю unlimit_server.sh" bash -c "bash <(wget -qO- https://dignezzz.github.io/server/unlimit_server.sh)"
   info_box "Готово" "Оптимизации применены."
 }
 
-# --- Шаг 9: Установка BBR3 и завершение мастера ---
+# --- Шаг 10/10: Установка BBR3 и завершение мастера ---
 step_bbr3_install_and_exit() {
   cls
-  yesno "Шаг 9/9 — Установить BBR3" "Запустить установку BBR3 сейчас? После установки скрипт завершится,\nа установщик BBR предложит перезагрузку." || return 0
+  yesno "Шаг 10/10 — Установить BBR3" "Запустить установку BBR3 сейчас? После установки скрипт завершится,\nа установщик BBR предложит перезагрузку." || return 0
 
   cls
   echo -e "\nЗапускаю установщик BBR3. После его завершения мастер выйдет.\nЕсли установщик попросит перезагрузку — соглашаемся.\n"
-  # Реальный запуск установщика BBR3
   bash <(curl -s https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh --ipv4) || true
-
   echo -e "\nМастер завершён. Продолжай по инструкциям установщика BBR (перезагрузка).\n"
   exit 0
 }
@@ -217,12 +264,12 @@ main() {
   step_ssh_hardening;      cls
   step_updates_now;        cls
   step_components;         cls
+  step_fail2ban_basic;     cls
   step_unattended;         cls
   step_journald_limits;    cls
   step_motd_custom;        cls
   step_sysctl_unlimit;     cls
   step_bbr3_install_and_exit
-  # до сюда не дойдём, т.к. шаг BBR завершает мастер
 }
 
 main "$@"
